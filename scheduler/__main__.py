@@ -5,9 +5,9 @@ import time
 import sys
 import traceback
 from indexer.celery import app
-from indexer.tasks import get_block, get_last_mc_block, get_account
+from indexer.tasks import get_block, get_last_mc_block, get_account, get_balance
 from indexer.database import init_database, SessionMaker
-from indexer.crud import get_existing_seqnos_between_interval, get_known_accounts_not_indexed, get_known_accounts_long_since_check
+from indexer.crud import get_existing_seqnos_between_interval, get_known_accounts_not_indexed, get_known_accounts_long_since_check, get_known_accounts_for_reindex
 from pytonlib import TonlibError, LiteServerTimeout, BlockDeleted
 from config import settings
 from loguru import logger
@@ -344,6 +344,66 @@ class AccountsIndexer(BaseScheduler):
             except BaseException as e:
                 logger.error(f"Task _read_results raised exception: {e}. {traceback.format_exc()}")
 
+class BalanceIndexer(AccountsIndexer):
+    def __init__(self, celery_queue):
+        super().__init__(celery_queue)
+
+    async def _push_to_queue(self):
+        while True:
+            try:
+                if len(self.accounts_to_process_queue) > 0:
+                    await asyncio.sleep(1)
+                    continue
+                async with SessionMaker() as session:
+                    accounts_to_index = await get_known_accounts_for_reindex(session, settings.indexer.accounts_index_batch)
+                    accounts_to_index = [x for x in accounts_to_index if not self._processing_now(x)]
+                    logger.info(f"{len(accounts_to_index)} accounts to balance re-index, current queue size: {len(self.accounts_to_process_queue)}")
+                    if len(accounts_to_index) == 0:
+                        logger.info(f"No accounts to balance re-index, sleeping")
+                        await asyncio.sleep(1)
+                        continue
+                self.accounts_to_process_queue.extend(accounts_to_index)
+
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                logger.warning("Task _push_to_queue was cancelled")
+                return
+            except BaseException as e:
+                logger.error("Task _push_to_queue raised exception: {exception}", exception=e)
+
+    async def _index_accounts(self):
+        while True:
+            try:
+                if not self.is_liteserver_up:
+                    await asyncio.sleep(1)
+                    continue
+
+                if len(self.running_tasks) > 4 * settings.indexer.workers_count:
+                    await asyncio.sleep(1)
+                    continue
+
+                chunk = []
+                while len(chunk) < settings.indexer.accounts_per_task:
+                    try:
+                        account = self.accounts_to_process_queue.popleft()
+                    except IndexError:
+                        break
+                    chunk.append(account[0])
+                    self.processing_now.add(account)
+
+                if len(chunk) == 0:
+                    await asyncio.sleep(1)
+                    continue
+
+                task = asyncify(get_balance, [chunk], serializer='pickle', queue=self.celery_queue)
+                self.running_tasks.append((self.loop.create_task(task), chunk))
+                logger.info(f"Running new task with {len(chunk)} accounts, total active tasks: {len(self.running_tasks)}")
+            except asyncio.CancelledError:
+                logger.warning("Task _index_accounts was cancelled")
+                return
+            except BaseException as e:
+                logger.error("Task _index_accounts raised exception: {exception}", exception=e)
+
 
 if __name__ == "__main__":
     if sys.argv[1] == 'backward':
@@ -357,6 +417,10 @@ if __name__ == "__main__":
     elif sys.argv[1] == 'accounts':
         wait_for_broker_connection()
         scheduler = AccountsIndexer(sys.argv[2])
+        scheduler.run(sys.argv[3] == 'create' if len(sys.argv) > 3 else False)
+    elif sys.argv[1] == 'balance':
+        wait_for_broker_connection()
+        scheduler = BalanceIndexer(sys.argv[2])
         scheduler.run(sys.argv[3] == 'create' if len(sys.argv) > 3 else False)
     else:
         raise Exception("Pass direction in argument: backward/forward or accounts")

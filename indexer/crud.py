@@ -2,7 +2,7 @@ import time
 from typing import Optional
 from collections import defaultdict
 
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, desc
 from sqlalchemy.orm import joinedload, Session, contains_eager
 from sqlalchemy.future import select
 from sqlalchemy.dialects.postgresql import insert as insert_pg
@@ -93,7 +93,7 @@ async def insert_by_seqno_core(session, blocks_raw, headers_raw, transactions_ra
         out_msgs_by_hash = defaultdict(list)
         msg_contents_by_hash = {}
         msg2utime = {}
-        unique_addresses = set()
+        unique_accounts = {}
 
         for block_raw, header_raw, txs_raw in zip(blocks_raw, headers_raw, transactions_raw):
             s_block = Block.raw_block_to_dict(block_raw)
@@ -115,8 +115,19 @@ async def insert_by_seqno_core(session, blocks_raw, headers_raw, transactions_ra
                 tx['block_id'] = block_id
                 res = await conn.execute(transaction_t.insert(), [tx])
 
-                if tx['compute_skip_reason'] not in ("cskip_bad_state", "cskip_no_state", "cskip_no_gas"):
-                    unique_addresses.add(Address(tx['account']).to_string(True, True, True))
+                address = Address(tx['account']).to_string(True, True, True)
+                if address in unique_accounts:
+                    unique_accounts[address]['last_tx_lt'] = max(unique_accounts[address]['last_tx_lt'], tx['lt'])
+                else:
+                    if tx['compute_skip_reason'] not in ("cskip_bad_state", "cskip_no_state", "cskip_no_gas"):
+                        unique_accounts[address] = KnownAccounts.generate(
+                            address=address, 
+                            mc_block_id=mc_block_id, 
+                            mc_seqno=mc_seqno,
+                            last_tx_lt=tx['lt'],
+                            last_tx_utime=tx['utime'],
+                            first_tx_utime=tx['utime'],
+                        )
 
                 if 'in_msg' in tx_details_raw:
                     in_msg_raw = tx_details_raw['in_msg']
@@ -221,15 +232,19 @@ async def insert_by_seqno_core(session, blocks_raw, headers_raw, transactions_ra
                     logger.info(f"{inserted_count} outbox items added")
 
 
-        if settings.indexer.discover_accounts_enabled and unique_addresses:
-            inserted_count = 0
-            for chunk in chunks(list(unique_addresses), 1000):
-                insert_res = await conn.execute(insert_pg(accounts_t)
-                    .values([KnownAccounts.generate(address=address, mc_block_id=mc_block_id, mc_seqno=mc_seqno) for address in chunk])
-                    .on_conflict_do_nothing())
-                inserted_count += insert_res.rowcount
-            if inserted_count > 0:
-                logger.info(f"New addresses discovered: {inserted_count}/{len(unique_addresses)}")
+        if settings.indexer.discover_accounts_enabled and unique_accounts:
+            updating_fields = ["mc_block_id", "mc_seqno", "last_tx_lt", "last_tx_utime"]
+            upserted_count = 0
+            for chunk in chunks(list(unique_accounts.values()), 1000):
+                stmt = insert_pg(accounts_t).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['address'], 
+                    set_={column.name: column for column in stmt.excluded if column.name in updating_fields}
+                )
+                upsert_res = await conn.execute(stmt)
+                upserted_count += upsert_res.rowcount
+            if upserted_count > 0:
+                logger.info(f"Unique accounts upserted: {upserted_count}/{len(unique_accounts)}")
 
 
 def get_transactions_by_masterchain_seqno(session, masterchain_seqno: int, include_msg_body: bool):
@@ -455,6 +470,14 @@ async def get_known_accounts_long_since_check(session: Session, min_days: int, l
 
     return query.all()
 
+async def get_known_accounts_for_reindex(session: Session, limit: int):
+    query = await session.execute(select(KnownAccounts.address) \
+                                  .filter(KnownAccounts.balance_tx_lt < KnownAccounts.last_tx_lt) \
+                                  .order_by(desc(KnownAccounts.last_tx_lt - KnownAccounts.balance_tx_lt)) \
+                                  .limit(limit))
+
+    return query.all()
+
 async def insert_account(account_raw, address):
     meta = Base.metadata
     accounts_state_t = meta.tables[AccountState.__tablename__]
@@ -483,8 +506,28 @@ async def insert_account(account_raw, address):
                                                                          ))
                                             .on_conflict_do_nothing())
 
-        await conn.execute(accounts_t.update().where(accounts_t.c.address == s_state['address'])\
-                           .values(last_check_time=int(datetime.today().timestamp()), mc_block_id=None, mc_seqno=None))
+        stmt = accounts_t.update().where(accounts_t.c.address == s_state['address']).values(
+            last_check_time=int(datetime.today().timestamp()),
+            code_hash=s_state['code_hash'],
+            balance=s_state['balance'] if s_state['code_hash'] else None,
+            balance_tx_lt=s_state['last_tx_lt'] if s_state['code_hash'] else None,
+        )
+        await conn.execute(stmt)
+
+async def insert_account_balance(account_raw, address):
+    meta = Base.metadata
+    accounts_t = meta.tables[KnownAccounts.__tablename__]
+
+    s_state = AccountState.raw_account_info_to_content_dict(account_raw, address)
+
+    async with engine.begin() as conn:
+        stmt = accounts_t.update().where(accounts_t.c.address == s_state['address']).values(
+            last_check_time=int(datetime.today().timestamp()),
+            code_hash=s_state['code_hash'],
+            balance=s_state['balance'] if s_state['code_hash'] else None,
+            balance_tx_lt=s_state['last_tx_lt'] if s_state['code_hash'] else None,
+        )
+        await conn.execute(stmt)
 
 async def reset_account(session: Session, address: str):
     await session.execute(
